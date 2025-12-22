@@ -488,10 +488,35 @@ TfLiteStatus InterpreterBuilder::ParseQuantization(
   quantization->type = kTfLiteAffineQuantization;
   auto* affine_quantization = reinterpret_cast<TfLiteAffineQuantization*>(
       malloc(sizeof(TfLiteAffineQuantization)));
-  affine_quantization->scale = TfLiteFloatArrayCreate(num_scales);
-  for (size_t i = 0; i < num_scales; ++i) {
-    affine_quantization->scale->data[i] = src_quantization->scale()->Get(i);
+  // Memory optimization: When the model is mmap-backed, avoid copying scale
+  // data by directly referencing the flatbuffer's scale array. The memory
+  // layout of flatbuffers::Vector<float> ([uint32_t length][float data[]]) is
+  // compatible with TfLiteFloatArray ([int size][float data[]]) on platforms
+  // where sizeof(int) == sizeof(uint32_t).
+  //
+  // Note: zero_point cannot use this optimization because the flatbuffer uses
+  // int64_t but TfLiteIntArray uses int32_t, requiring conversion.
+  const bool can_borrow_scale =
+      allocation_ != nullptr &&
+      allocation_->type() == Allocation::Type::kMMap &&
+      sizeof(int) == sizeof(uint32_t);
+
+  if (can_borrow_scale) {
+    // Borrow scale directly from mmap'd flatbuffer (zero-copy).
+    // The flatbuffers::Vector<float> pointer points to the length field,
+    // followed by the float data - matching TfLiteFloatArray layout.
+    affine_quantization->scale = const_cast<TfLiteFloatArray*>(
+        reinterpret_cast<const TfLiteFloatArray*>(src_quantization->scale()));
+    affine_quantization->scale_is_borrowed = true;
+  } else {
+    // Copy scale data to heap (original behavior).
+    affine_quantization->scale = TfLiteFloatArrayCreate(num_scales);
+    for (size_t i = 0; i < num_scales; ++i) {
+      affine_quantization->scale->data[i] = src_quantization->scale()->Get(i);
+    }
+    affine_quantization->scale_is_borrowed = false;
   }
+  // Zero point must always be copied due to int64_t -> int32_t conversion.
   if (all_zero_points_same) {
     affine_quantization->zero_point = TfLiteIntArrayCreate(1);
     affine_quantization->zero_point->data[0] = zero_point;
@@ -502,6 +527,7 @@ TfLiteStatus InterpreterBuilder::ParseQuantization(
           src_quantization->zero_point()->Get(i);
     }
   }
+  affine_quantization->zero_point_is_borrowed = false;
   affine_quantization->quantized_dimension =
       src_quantization->quantized_dimension();
   quantization->params = reinterpret_cast<void*>(affine_quantization);

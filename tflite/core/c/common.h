@@ -357,6 +357,16 @@ typedef struct TfLiteAffineQuantization {
   TfLiteFloatArray* scale;
   TfLiteIntArray* zero_point;
   int32_t quantized_dimension;
+  // Ownership flags for memory management optimization.
+  // When true, the corresponding array was heap-allocated and must be freed.
+  // When false, the array points to memory-mapped (mmap) data and must NOT be
+  // freed. These flags enable zero-copy quantization when loading mmap-backed
+  // models.
+  // NOTE: For backward compatibility with code that uses calloc() to allocate
+  // this struct (which zero-initializes all fields), false means "owned" by
+  // default. We use "is_borrowed" semantics: false = owned, true = borrowed.
+  bool scale_is_borrowed;
+  bool zero_point_is_borrowed;
 } TfLiteAffineQuantization;
 
 /// Parameters for blockwise quantization across the output channels dimension.

@@ -241,11 +241,14 @@ void TfLiteQuantizationFree(TfLiteQuantization* quantization) {
   if (quantization->type == kTfLiteAffineQuantization) {
     TfLiteAffineQuantization* q_params =
         reinterpret_cast<TfLiteAffineQuantization*>(quantization->params);
-    if (q_params->scale) {
+    // Only free arrays that are owned (not borrowed from mmap).
+    // Note: scale_is_borrowed/zero_point_is_borrowed == false means owned
+    // (for backward compatibility with calloc-allocated structs).
+    if (q_params->scale && !q_params->scale_is_borrowed) {
       TfLiteFloatArrayFree(q_params->scale);
       q_params->scale = nullptr;
     }
-    if (q_params->zero_point) {
+    if (q_params->zero_point && !q_params->zero_point_is_borrowed) {
       TfLiteIntArrayFree(q_params->zero_point);
       q_params->zero_point = nullptr;
     }
