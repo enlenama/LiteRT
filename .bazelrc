@@ -272,6 +272,9 @@ build:macos --copt=-w
 build:windows --copt=/W0
 build:windows --host_copt=/W0
 
+# Exclude OpenCL from Windows builds.
+build:windows --copt=/DLITERT_DISABLE_OPENCL_SUPPORT=1
+
 # Suppress most C++ compiler warnings to reduce log size but allow
 # for specific warnings to still be present.
 build:linux --copt="-Wno-all"
