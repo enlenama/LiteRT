@@ -14,10 +14,18 @@
 
 #include "litert/vendors/intel_openvino/compiler/npu_optimizer.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <functional>
+#include <map>
 #include <memory>
+#include <optional>
+#include <set>
+#include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "openvino/core/graph_util.hpp"
@@ -32,14 +40,23 @@
 #include "openvino/op/concat.hpp"
 #include "openvino/op/constant.hpp"
 #include "openvino/op/convert.hpp"
+#include "openvino/op/equal.hpp"
 #include "openvino/op/fake_quantize.hpp"
+#include "openvino/op/gather.hpp"
+#include "openvino/op/gelu.hpp"
 #include "openvino/op/matmul.hpp"
+#include "openvino/op/multiply.hpp"
 #include "openvino/op/pad.hpp"
+#include "openvino/op/reduce_sum.hpp"
+#include "openvino/op/reshape.hpp"
 #include "openvino/op/scaled_dot_product_attention.hpp"
 #include "openvino/op/sign.hpp"
 #include "openvino/op/slice.hpp"
 #include "openvino/op/softmax.hpp"
+#include "openvino/op/squeeze.hpp"
 #include "openvino/op/strided_slice.hpp"
+#include "openvino/op/topk.hpp"
+#include "openvino/op/unsqueeze.hpp"
 #include "openvino/op/util/attr_types.hpp"
 #include "openvino/op/transpose.hpp"
 #include "openvino/pass/manager.hpp"
@@ -455,6 +472,636 @@ FuseSplitAttentionToSDPA::FuseSplitAttentionToSDPA(bool pad_kv_to_alignment) {
   register_matcher(m, callback);
 }
 
+// ===========================================================================
+// MoEGatherSelect  (Gemma4 dense MoE -> gather-based selective computation)
+// See moe_spike.md §0.1 (expert unit) and §B' (algorithm), and
+// vpux_knowleg.md §7 (GatherDMA) for the on-device lowering rationale.
+// ===========================================================================
+namespace {
+
+// One expert's SwiGLU branch (moe_spike.md §0.1):
+//   hidden -> up/gate MatMul(W_up) -> Slice/Gelu/Mul (SwiGLU) ->
+//   down MatMul(W_down) -> Multiply(x router score) -> Add (into accum chain)
+struct ExpertBranch {
+  int64_t expert_id = -1;                           // read from the Equal const
+  std::shared_ptr<ov::op::v0::MatMul> up_matmul;    // gate/up projection
+  std::shared_ptr<ov::op::v0::MatMul> down_matmul;  // down projection
+  ov::Output<ov::Node> w_up_src;    // weight source to stack (post i4 dequant)
+  ov::Output<ov::Node> w_down_src;
+  // Raw pre-dequant source, when the up/down weight is a
+  // Multiply(Convert(Constant<u4/i4>), scale) pattern: the packed Constant
+  // and its dequant scale, plus the Convert's target type. Populated by
+  // find_dequant_source(); w_up_has_dequant/w_down_has_dequant are false
+  // (and the *_packed/*_scale fields unset) when the pattern isn't found,
+  // in which case callers must fall back to stacking w_up_src/w_down_src.
+  ov::Output<ov::Node> w_up_packed;
+  ov::Output<ov::Node> w_up_scale;
+  ov::element::Type w_up_dequant_type;
+  bool w_up_has_dequant = false;
+  ov::Output<ov::Node> w_down_packed;
+  ov::Output<ov::Node> w_down_scale;
+  ov::element::Type w_down_dequant_type;
+  bool w_down_has_dequant = false;
+  ov::Output<ov::Node> score;          // per-expert router score (mask input)
+  ov::Output<ov::Node> router_weights;  // shared [1,K] routing-weight vector
+  ov::Output<ov::Node> branch_output;  // masked output feeding the Add chain
+  std::shared_ptr<ov::Node> chain_add;  // this branch's link in the Add chain
+};
+
+struct MoELayer {
+  std::shared_ptr<ov::op::v11::TopK> topk;
+  ov::Output<ov::Node> topk_indices;  // TopK output(1)
+  int64_t k = 0;                      // active experts (top-K)
+  int64_t num_experts = 0;            // total experts (=128 for Gemma4-26B)
+  std::vector<ExpertBranch> experts;  // filled + sorted by expert_id
+  // The router's per-position routing-weight vector [1,K] that dense multiplies
+  // each expert by (shared across all experts). Gemma4's router is
+  // SoftMax(128) -> TopK -> divide-by-sum renormalize; the vector fed to each
+  // expert's Equal-masked ReduceSum is that fully-normalized result, NOT the
+  // raw TopK value. Captured in collect_expert_branch.
+  ov::Output<ov::Node> router_weights;
+};
+
+// Reads the constant expert-id an Equal(topk_indices, const) compares against.
+// Returns nullopt if input(1) is not a 1-element Constant.
+std::optional<int64_t> equal_expert_id(const std::shared_ptr<ov::Node>& equal) {
+  auto c = std::dynamic_pointer_cast<ov::op::v0::Constant>(
+      equal->input_value(1).get_node_shared_ptr());
+  if (!c || ov::shape_size(c->get_shape()) != 1) return std::nullopt;
+  return c->cast_vector<int64_t>().front();
+}
+
+// Walks forward from |out| through single-consumer nodes (max |max_depth|
+// hops) looking for the first node matching |pred|. Returns nullptr if the
+// chain forks (a consumer count != 1) or |pred| isn't matched in time.
+std::shared_ptr<ov::Node> find_descendant(
+    const ov::Output<ov::Node>& out,
+    const std::function<bool(const std::shared_ptr<ov::Node>&)>& pred,
+    int max_depth) {
+  ov::Output<ov::Node> cur = out;
+  for (int i = 0; i < max_depth; ++i) {
+    if (cur.get_target_inputs().size() != 1) return nullptr;
+    auto n = cur.get_target_inputs().begin()->get_node()->shared_from_this();
+    if (pred(n)) return n;
+    cur = n->output(0);
+  }
+  return nullptr;
+}
+
+// Walks backward from |out| along input(0) (max |max_depth| hops) looking for
+// the first ov::op::v0::MatMul. This follows the §0.1 SwiGLU chain (Multiply
+// -> Gelu -> Slice -> MatMul, or MatMul -> ... -> MatMul) since each of those
+// ops keeps the "main" data path on input(0).
+std::shared_ptr<ov::op::v0::MatMul> find_ancestor_matmul(
+    const ov::Output<ov::Node>& out, int max_depth) {
+  std::shared_ptr<ov::Node> n = out.get_node_shared_ptr();
+  for (int i = 0; i < max_depth; ++i) {
+    if (auto mm = std::dynamic_pointer_cast<ov::op::v0::MatMul>(n)) return mm;
+    if (n->get_input_size() == 0) return nullptr;
+    n = n->input_value(0).get_node_shared_ptr();
+  }
+  return nullptr;
+}
+
+// Detects the weight-compression pattern feeding a MatMul weight input:
+//   Multiply(Convert(Constant<u4/i4>), scale)
+// (operand order may be either way). On match, returns the raw packed
+// Constant, the dequant scale, and the Convert's target element type;
+// returns false if |weight_src| isn't that exact shape (e.g. weights are
+// stored uncompressed), in which case the caller must stack/gather
+// |weight_src| directly instead.
+bool find_dequant_source(const ov::Output<ov::Node>& weight_src,
+                          ov::Output<ov::Node>& packed_out,
+                          ov::Output<ov::Node>& scale_out,
+                          ov::element::Type& dequant_type_out) {
+  auto mul = std::dynamic_pointer_cast<ov::op::v1::Multiply>(
+      weight_src.get_node_shared_ptr());
+  if (!mul) return false;
+  for (size_t i = 0; i < 2; ++i) {
+    auto convert = std::dynamic_pointer_cast<ov::op::v0::Convert>(
+        mul->input_value(i).get_node_shared_ptr());
+    if (!convert) continue;
+    auto packed = std::dynamic_pointer_cast<ov::op::v0::Constant>(
+        convert->input_value(0).get_node_shared_ptr());
+    if (!packed) continue;
+    const auto& packed_type = packed->get_element_type();
+    if (packed_type != ov::element::u4 && packed_type != ov::element::i4)
+      continue;
+    packed_out = convert->input_value(0);
+    scale_out = mul->input_value(1 - i);
+    dequant_type_out = convert->get_element_type();
+    return true;
+  }
+  return false;
+}
+
+// Matches one expert's SwiGLU branch starting from its Equal mask node
+// (moe_spike.md §0.1):
+//   Equal(indices==expert_id) -> ReduceSum(score) -> Multiply(mask) -> Add
+// and, from the Multiply's non-score input, backs up through
+//   down_matmul <- SwiGLU (Multiply/Gelu/Slice) <- up_matmul
+// Returns false (leaving the graph untouched) if any step doesn't match —
+// callers must treat that expert as "not found" rather than guessing.
+bool collect_expert_branch(const std::shared_ptr<ov::Node>& equal_node,
+                           ExpertBranch& out) {
+  auto id = equal_expert_id(equal_node);
+  if (!id) return false;
+  out.expert_id = *id;
+
+  auto reduce = find_descendant(
+      equal_node->output(0),
+      [](const std::shared_ptr<ov::Node>& n) {
+        return ov::is_type<ov::op::v1::ReduceSum>(n);
+      },
+      /*max_depth=*/3);
+  if (!reduce) return false;
+  out.score = reduce->output(0);
+
+  // Capture the router's per-position routing-weight vector: the operand of the
+  // Multiply feeding this score ReduceSum that is NOT the Equal mask.
+  //   Equal(indices==e) -> Convert -> Multiply(mask, router_weights) -> ReduceSum
+  // (XML: EQUAL_id_252 -> CAST_id_253 -> MUL_id_254 -> SUM_id_255; MUL_id_254's
+  //  non-mask operand is MUL_id_250, the divide-by-sum renormalized top-K
+  //  weights [1,K]). Using this instead of TopK.output(0) is what makes the
+  //  gather-K weighting match the dense graph exactly.
+  auto premul = std::dynamic_pointer_cast<ov::op::v1::Multiply>(
+      reduce->input_value(0).get_node_shared_ptr());
+  if (!premul) return false;
+  auto traces_to_equal = [&](const ov::Output<ov::Node>& o) {
+    ov::Node* n = o.get_node();
+    for (int i = 0; i < 4 && n; ++i) {
+      if (n == equal_node.get()) return true;
+      if (n->get_input_size() == 0) break;
+      n = n->input_value(0).get_node();
+    }
+    return false;
+  };
+  const bool in0_is_mask = traces_to_equal(premul->input_value(0));
+  const bool in1_is_mask = traces_to_equal(premul->input_value(1));
+  if (in0_is_mask == in1_is_mask) return false;  // can't disambiguate -> bail
+  out.router_weights = in0_is_mask ? premul->input_value(1)
+                                   : premul->input_value(0);
+
+  auto mult = find_descendant(
+      reduce->output(0),
+      [](const std::shared_ptr<ov::Node>& n) {
+        return ov::is_type<ov::op::v1::Multiply>(n);
+      },
+      /*max_depth=*/2);
+  if (!mult) return false;
+
+  auto add = find_descendant(
+      mult->output(0),
+      [](const std::shared_ptr<ov::Node>& n) {
+        return ov::is_type<ov::op::v1::Add>(n);
+      },
+      /*max_depth=*/2);
+  if (!add) return false;
+  out.branch_output = mult->output(0);
+  out.chain_add = add;
+
+  // The Multiply's other input is the pre-mask branch (down-proj) output.
+  const bool score_is_input0 = mult->input_value(0) == reduce->output(0);
+  ov::Output<ov::Node> branch_val =
+      score_is_input0 ? mult->input_value(1) : mult->input_value(0);
+
+  auto down_mm = find_ancestor_matmul(branch_val, /*max_depth=*/4);
+  if (!down_mm) return false;
+  out.down_matmul = down_mm;
+  out.w_down_src = down_mm->input_value(1);
+  out.w_down_has_dequant = find_dequant_source(
+      out.w_down_src, out.w_down_packed, out.w_down_scale,
+      out.w_down_dequant_type);
+
+  auto up_mm = find_ancestor_matmul(down_mm->input_value(0), /*max_depth=*/4);
+  if (!up_mm || up_mm == down_mm) return false;
+  out.up_matmul = up_mm;
+  out.w_up_src = up_mm->input_value(1);
+  out.w_up_has_dequant = find_dequant_source(
+      out.w_up_src, out.w_up_packed, out.w_up_scale, out.w_up_dequant_type);
+
+  return true;
+}
+
+// Discovers all MoE layers: each router TopK, its expert branches (via the
+// Equal consumers of TopK.output(1)), and K.
+std::vector<MoELayer> find_moe_layers(const std::shared_ptr<ov::Model>& model) {
+  std::vector<MoELayer> layers;
+  for (const auto& node : model->get_ordered_ops()) {
+    auto topk = std::dynamic_pointer_cast<ov::op::v11::TopK>(node);
+    if (!topk) continue;
+
+    MoELayer layer;
+    layer.topk = topk;
+    layer.topk_indices = topk->output(1);
+
+    if (auto kc = std::dynamic_pointer_cast<ov::op::v0::Constant>(
+            topk->input_value(1).get_node_shared_ptr())) {
+      if (ov::shape_size(kc->get_shape()) >= 1)
+        layer.k = kc->cast_vector<int64_t>().front();
+    }
+
+    // The indices (output 1) drive one per-expert Equal mask each.
+    std::vector<std::shared_ptr<ov::Node>> equals;
+    for (const auto& ti : layer.topk_indices.get_target_inputs()) {
+      auto n = ti.get_node()->shared_from_this();
+      if (std::dynamic_pointer_cast<ov::op::v1::Equal>(n)) equals.push_back(n);
+    }
+    if (equals.size() < 2) continue;  // not a router-style TopK
+    layer.num_experts = static_cast<int64_t>(equals.size());
+
+    for (const auto& eq : equals) {
+      ExpertBranch br;
+      if (collect_expert_branch(eq, br)) layer.experts.push_back(std::move(br));
+    }
+    std::sort(layer.experts.begin(), layer.experts.end(),
+              [](const ExpertBranch& a, const ExpertBranch& b) {
+                return a.expert_id < b.expert_id;
+              });
+    // The routing-weight vector is shared across all experts; lift it to layer.
+    if (!layer.experts.empty())
+      layer.router_weights = layer.experts.front().router_weights;
+    layers.push_back(std::move(layer));
+  }
+  return layers;
+}
+
+// Stacks per-expert weight sources (sorted by expert_id) into a grouped
+// [N, ...] value via Concat(Unsqueeze(w_e, 0)...). Used for W_up / W_down.
+ov::Output<ov::Node> stack_by_expert_id(
+    const std::vector<ov::Output<ov::Node>>& per_expert /*sorted*/) {
+  ov::OutputVector unsq;
+  unsq.reserve(per_expert.size());
+  auto axis0 = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {0});
+  for (const auto& w : per_expert) {
+    unsq.push_back(std::make_shared<ov::op::v0::Unsqueeze>(w, axis0));
+  }
+  return std::make_shared<ov::op::v0::Concat>(unsq, 0);
+}
+
+// Stacks per-expert raw Constants (sorted by expert_id) into one grouped
+// [N, ...] Constant by directly concatenating their raw byte buffers,
+// bypassing the generic Concat/Unsqueeze ops entirely.
+//
+// This exists specifically for sub-byte packed weight types (u4/i4): OV's
+// Concat/Unsqueeze constant-folding evaluate() decompresses such types to a
+// wider element type when it materializes the folded result (observed:
+// u4/i4 -> a wider type), which would silently multiply the grouped weight
+// constant's on-disk size by 2-8x. Building the merged Constant's data
+// buffer ourselves guarantees the packed representation survives unchanged.
+//
+// Returns nullptr if any input isn't a Constant, element types/shapes
+// aren't uniform across experts, or a per-expert tensor isn't byte-aligned
+// (element_count * bitwidth not a multiple of 8) — callers must fall back
+// to stack_by_expert_id() on the dequantized value in that case.
+std::shared_ptr<ov::op::v0::Constant> stack_constants_raw(
+    const ov::OutputVector& per_expert /*sorted*/) {
+  std::vector<std::shared_ptr<ov::op::v0::Constant>> consts;
+  consts.reserve(per_expert.size());
+  for (const auto& o : per_expert) {
+    auto c =
+        std::dynamic_pointer_cast<ov::op::v0::Constant>(o.get_node_shared_ptr());
+    if (!c) return nullptr;
+    consts.push_back(c);
+  }
+  if (consts.empty()) return nullptr;
+
+  const ov::element::Type type = consts.front()->get_element_type();
+  const ov::Shape per_shape = consts.front()->get_shape();
+  const size_t per_elems = ov::shape_size(per_shape);
+  for (const auto& c : consts) {
+    if (c->get_element_type() != type ||
+        ov::shape_size(c->get_shape()) != per_elems)
+      return nullptr;
+  }
+
+  const size_t bits = type.bitwidth();
+  if ((per_elems * bits) % 8 != 0) return nullptr;
+  const size_t per_bytes = (per_elems * bits) / 8;
+
+  ov::Shape new_shape;
+  new_shape.reserve(per_shape.size() + 1);
+  new_shape.push_back(consts.size());
+  new_shape.insert(new_shape.end(), per_shape.begin(), per_shape.end());
+
+  std::vector<uint8_t> buffer(per_bytes * consts.size());
+  for (size_t i = 0; i < consts.size(); ++i) {
+    std::memcpy(buffer.data() + i * per_bytes, consts[i]->get_data_ptr(),
+                per_bytes);
+  }
+  return std::make_shared<ov::op::v0::Constant>(type, new_shape,
+                                                 buffer.data());
+}
+
+// Rewrites one MoE layer into gather-K form (moe_spike.md §B'):
+//   1. Stack per-expert weights (sorted by expert_id) into grouped [N,...]
+//      constants and Gather the K selected by the router.
+//   2. Recompute the up-proj with the gathered weights (batched MatMul of
+//      hidden [1,H] against gu [K,gate_up,H] -> [K,1,gate_up] -> [K,gate_up]),
+//      then rebuild the SwiGLU EXPLICITLY (feature-axis slices + Gelu-TANH) and
+//      the down-proj as a batched MatMul. The SwiGLU is rebuilt rather than
+//      cloned because the model's SwiGLU Slice carries a batch-1-baked size
+//      that would truncate the K experts back to 1 (see body).
+//   3. Weight each of the K down-proj outputs by layer.router_weights (the
+//      dense graph's actual per-position routing weight [1,K], divide-by-sum
+//      renormalized -- NOT the raw TopK value) and ReduceSum over the K axis.
+//   4. Replace the final node of the 128-way Add accumulation chain (the one
+//      not itself consumed by another expert's chain_add) with that sum.
+// Returns false (graph untouched) if the chain shape isn't as expected.
+bool regroup_and_rewrite(MoELayer& layer) {
+  const std::string name = layer.topk->get_friendly_name();
+  if (layer.experts.size() != static_cast<size_t>(layer.num_experts) ||
+      layer.k <= 0) {
+    LITERT_LOG(LITERT_INFO,
+               "[MoEGather] rewrite[%s]: abort: experts.size()=%zu "
+               "num_experts=%ld k=%ld",
+               name.c_str(), layer.experts.size(),
+               static_cast<long>(layer.num_experts),
+               static_cast<long>(layer.k));
+    return false;
+  }
+  if (!layer.router_weights.get_node_shared_ptr()) {
+    LITERT_LOG(LITERT_INFO,
+               "[MoEGather] rewrite[%s]: abort: router weight vector not "
+               "captured (unexpected router topology)",
+               name.c_str());
+    return false;
+  }
+  // Gather indexes the grouped weight table by expert_id value while rows are
+  // stacked in sorted-expert_id order; only correct when the sorted expert_ids
+  // are exactly 0..N-1 (contiguous). Confirmed for Gemma4 (branch p tests
+  // topk==p and uses weight_p); bail to dense otherwise.
+  for (size_t i = 0; i < layer.experts.size(); ++i) {
+    if (layer.experts[i].expert_id != static_cast<int64_t>(i)) {
+      LITERT_LOG(LITERT_INFO,
+                 "[MoEGather] rewrite[%s]: abort: expert_ids not contiguous "
+                 "0..N-1 (experts[%zu].expert_id=%ld)",
+                 name.c_str(), i, static_cast<long>(layer.experts[i].expert_id));
+      return false;
+    }
+  }
+  // The fused gate+up projection width must be statically known and even (it is
+  // sliced in half: gate | up) to reproduce the original two-Slice SwiGLU.
+  const auto up_ps = layer.experts.front().up_matmul->get_output_partial_shape(0);
+  const int64_t up_rank = up_ps.rank().is_static() ? up_ps.rank().get_length() : 0;
+  if (up_rank < 1 || !up_ps[up_rank - 1].is_static() ||
+      up_ps[up_rank - 1].get_length() % 2 != 0) {
+    LITERT_LOG(LITERT_INFO,
+               "[MoEGather] rewrite[%s]: abort: gate+up width not static/even",
+               name.c_str());
+    return false;
+  }
+  const int64_t half = up_ps[up_rank - 1].get_length() / 2;
+
+  std::set<ov::Node*> chain_adds;
+  for (auto& e : layer.experts) chain_adds.insert(e.chain_add.get());
+  std::shared_ptr<ov::Node> final_add;
+  int root_count = 0;
+  for (auto& e : layer.experts) {
+    bool feeds_another_chain_add = false;
+    for (const auto& ti : e.chain_add->output(0).get_target_inputs()) {
+      if (chain_adds.count(ti.get_node())) {
+        feeds_another_chain_add = true;
+        break;
+      }
+    }
+    if (!feeds_another_chain_add) {
+      ++root_count;
+      final_add = e.chain_add;
+    }
+  }
+  if (root_count != 1) {
+    LITERT_LOG(LITERT_INFO,
+               "[MoEGather] rewrite[%s]: abort: found %d chain roots "
+               "(expected exactly 1)",
+               name.c_str(), root_count);
+    return false;
+  }
+
+  auto k_shape =
+      ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {layer.k});
+  auto idx = std::make_shared<ov::op::v1::Reshape>(layer.topk_indices,
+                                                    k_shape, false);
+  auto axis0 = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {0});
+
+  auto& ref = layer.experts.front();
+
+  // Prefer gathering the raw i4/u4-packed weight + scale and dequantizing
+  // only the K selected rows afterward (stack_constants_raw preserves the
+  // packed type exactly). Falls back to stacking/gathering the already-
+  // dequantized w_*_src when the per-expert weight isn't in that packed
+  // Multiply(Convert(Constant<u4/i4>), scale) form — at the cost of a
+  // larger grouped constant (dequantized upfront for all N experts).
+  bool all_up_dequant = true, all_down_dequant = true;
+  for (auto& e : layer.experts) {
+    all_up_dequant = all_up_dequant && e.w_up_has_dequant;
+    all_down_dequant = all_down_dequant && e.w_down_has_dequant;
+  }
+
+  ov::Output<ov::Node> gu;
+  if (all_up_dequant) {
+    ov::OutputVector packed, scales;
+    packed.reserve(layer.experts.size());
+    scales.reserve(layer.experts.size());
+    for (auto& e : layer.experts) {
+      packed.push_back(e.w_up_packed);
+      scales.push_back(e.w_up_scale);
+    }
+    std::shared_ptr<ov::Node> grouped_scale = stack_constants_raw(scales);
+    if (auto grouped_packed = stack_constants_raw(packed)) {
+      if (!grouped_scale) {
+        LITERT_LOG(LITERT_INFO,
+                   "[MoEGather] rewrite[%s]: up-proj scale not a plain "
+                   "Constant; falling back to Concat for scale",
+                   name.c_str());
+        grouped_scale = stack_by_expert_id(scales).get_node_shared_ptr();
+      }
+      auto g_packed =
+          std::make_shared<ov::op::v8::Gather>(grouped_packed, idx, axis0);
+      auto g_scale =
+          std::make_shared<ov::op::v8::Gather>(grouped_scale, idx, axis0);
+      auto g_dequant =
+          std::make_shared<ov::op::v0::Convert>(g_packed, ref.w_up_dequant_type);
+      gu = std::make_shared<ov::op::v1::Multiply>(g_dequant, g_scale);
+    }
+  }
+  if (!gu.get_node_shared_ptr()) {
+    LITERT_LOG(LITERT_INFO,
+               "[MoEGather] rewrite[%s]: up-proj i4 packing not detected or "
+               "not byte-aligned; falling back to gathering dequantized "
+               "weights (larger grouped constant)",
+               name.c_str());
+    ov::OutputVector up_srcs;
+    up_srcs.reserve(layer.experts.size());
+    for (auto& e : layer.experts) up_srcs.push_back(e.w_up_src);
+    ov::Output<ov::Node> grouped_up;
+    if (auto raw = stack_constants_raw(up_srcs)) {
+      grouped_up = raw;
+    } else {
+      LITERT_LOG(LITERT_INFO,
+                 "[MoEGather] rewrite[%s]: up_src not plain Constants; "
+                 "falling back to Concat",
+                 name.c_str());
+      grouped_up = stack_by_expert_id(up_srcs);
+    }
+    gu = std::make_shared<ov::op::v8::Gather>(grouped_up, idx, axis0);
+  }
+
+  ov::Output<ov::Node> gd;
+  if (all_down_dequant) {
+    ov::OutputVector packed, scales;
+    packed.reserve(layer.experts.size());
+    scales.reserve(layer.experts.size());
+    for (auto& e : layer.experts) {
+      packed.push_back(e.w_down_packed);
+      scales.push_back(e.w_down_scale);
+    }
+    std::shared_ptr<ov::Node> grouped_scale = stack_constants_raw(scales);
+    if (auto grouped_packed = stack_constants_raw(packed)) {
+      if (!grouped_scale) {
+        LITERT_LOG(LITERT_INFO,
+                   "[MoEGather] rewrite[%s]: down-proj scale not a plain "
+                   "Constant; falling back to Concat for scale",
+                   name.c_str());
+        grouped_scale = stack_by_expert_id(scales).get_node_shared_ptr();
+      }
+      auto g_packed =
+          std::make_shared<ov::op::v8::Gather>(grouped_packed, idx, axis0);
+      auto g_scale =
+          std::make_shared<ov::op::v8::Gather>(grouped_scale, idx, axis0);
+      auto g_dequant = std::make_shared<ov::op::v0::Convert>(
+          g_packed, ref.w_down_dequant_type);
+      gd = std::make_shared<ov::op::v1::Multiply>(g_dequant, g_scale);
+    }
+  }
+  if (!gd.get_node_shared_ptr()) {
+    LITERT_LOG(LITERT_INFO,
+               "[MoEGather] rewrite[%s]: down-proj i4 packing not detected "
+               "or not byte-aligned; falling back to gathering dequantized "
+               "weights (larger grouped constant)",
+               name.c_str());
+    ov::OutputVector down_srcs;
+    down_srcs.reserve(layer.experts.size());
+    for (auto& e : layer.experts) down_srcs.push_back(e.w_down_src);
+    ov::Output<ov::Node> grouped_down;
+    if (auto raw = stack_constants_raw(down_srcs)) {
+      grouped_down = raw;
+    } else {
+      LITERT_LOG(LITERT_INFO,
+                 "[MoEGather] rewrite[%s]: down_src not plain Constants; "
+                 "falling back to Concat",
+                 name.c_str());
+      grouped_down = stack_by_expert_id(down_srcs);
+    }
+    gd = std::make_shared<ov::op::v8::Gather>(grouped_down, idx, axis0);
+  }
+
+  // Batched up/gate projection. Keep hidden as [1,H] (do NOT squeeze to 1-D --
+  // 1-D MatMul lowers poorly on the NPU). MatMul([1,H], gu[K,gate_up,H],
+  // transpose_b) broadcasts to [K,1,gate_up]; squeeze the size-1 middle dim.
+  auto new_up_bcast = ref.up_matmul->clone_with_new_inputs(
+      {ref.up_matmul->input_value(0), gu});
+  auto sq_axis1 =
+      ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {1});
+  auto up_2d = std::make_shared<ov::op::v0::Squeeze>(new_up_bcast, sq_axis1);
+
+  // Reproduce the original SwiGLU faithfully: two Slice ops (one per consumer
+  // chain -- gate half and up half), a Gelu, and a Multiply. The ONLY deviation
+  // forced by the weights-gather is the slice axis: the original Slice carries a
+  // batch-1-baked size ([1,half]) that would truncate our K experts (axis 0)
+  // back to 1, so we slice only the feature axis (axes=[1]) and leave axis 0
+  // (the K experts) untouched. gate=[:,0:half] (Gelu-TANH), up=[:,half:2*half].
+  auto slice_step =
+      ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {1});
+  auto slice_axis =
+      ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {1});
+  auto gate_start =
+      ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {0});
+  auto gate_stop =
+      ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {half});
+  auto gate = std::make_shared<ov::op::v8::Slice>(up_2d, gate_start, gate_stop,
+                                                  slice_step, slice_axis);
+  auto up_start =
+      ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {half});
+  auto up_stop =
+      ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {2 * half});
+  auto up_half = std::make_shared<ov::op::v8::Slice>(up_2d, up_start, up_stop,
+                                                     slice_step, slice_axis);
+  auto gate_act = std::make_shared<ov::op::v7::Gelu>(
+      gate, ov::op::GeluApproximationMode::TANH);
+  auto swiglu = std::make_shared<ov::op::v1::Multiply>(gate_act, up_half);
+
+  // Batched down projection: [K,half] -> [K,1,half] to batch-matmul against
+  // gd[K,H,half] (transpose_b) -> [K,1,H].
+  auto un_axis1 =
+      ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {1});
+  auto swiglu_3d = std::make_shared<ov::op::v0::Unsqueeze>(swiglu, un_axis1);
+  auto new_down = ref.down_matmul->clone_with_new_inputs({swiglu_3d, gd});
+
+  // Weight each expert by the dense graph's actual routing-weight vector
+  // (renormalized [1,K], captured as layer.router_weights) -- NOT TopK.output(0)
+  // which lacks Gemma4's divide-by-sum renormalization -- then sum over K.
+  auto weights = std::make_shared<ov::op::v1::Reshape>(layer.router_weights,
+                                                       k_shape, false);
+  auto weights_bshape = ov::op::v0::Constant::create(
+      ov::element::i64, ov::Shape{3}, std::vector<int64_t>{layer.k, 1, 1});
+  auto weights_b =
+      std::make_shared<ov::op::v1::Reshape>(weights, weights_bshape, false);
+  auto weighted = std::make_shared<ov::op::v1::Multiply>(new_down, weights_b);
+  auto reduce_axis =
+      ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {0});
+  auto summed =
+      std::make_shared<ov::op::v1::ReduceSum>(weighted, reduce_axis, false);
+
+  summed->set_friendly_name(final_add->get_friendly_name());
+  ov::copy_runtime_info(
+      final_add,
+      {new_up_bcast, up_2d, gate, up_half, gate_act, swiglu, swiglu_3d, new_down,
+       gu.get_node_shared_ptr(), gd.get_node_shared_ptr(), weights, weights_b,
+       weighted, summed});
+  ov::replace_node(final_add, summed);
+  LITERT_LOG(LITERT_INFO,
+             "[MoEGather] rewrite[%s]: OK, replaced chain root '%s' with "
+             "gather-K subgraph",
+             name.c_str(), summed->get_friendly_name().c_str());
+  return true;
+}
+
+}  // namespace
+
+bool MoEGatherSelect::run_on_model(const std::shared_ptr<ov::Model>& model) {
+  auto layers = find_moe_layers(model);
+  LITERT_LOG(LITERT_INFO, "[MoEGather] discovered %zu candidate MoE layer(s)",
+             layers.size());
+
+  bool changed = false;
+  for (auto& layer : layers) {
+    // Decode/generate only: the gather form assumes a single token. At this
+    // point (right after the TFLite frontend, before shape resolution) the
+    // batch dim may still be dynamic, so only reject when it is STATICALLY not
+    // 1 — matching NPUW's DeviceRoutedMoETransform guard. The concrete K used
+    // for the gather comes from the TopK 'k' constant, not from this shape.
+    const auto ishape = layer.topk_indices.get_partial_shape();
+    const bool decode_ok =
+        !(ishape.rank().is_static() && ishape.rank().get_length() >= 1 &&
+          ishape[0].is_static() && ishape[0].get_length() != 1);
+
+    std::ostringstream shp;
+    shp << ishape;
+    LITERT_LOG(
+        LITERT_INFO,
+        "[MoEGather] layer TopK='%s' K=%ld experts=%ld matched=%zu "
+        "indices=%s%s",
+        layer.topk->get_friendly_name().c_str(), static_cast<long>(layer.k),
+        static_cast<long>(layer.num_experts), layer.experts.size(),
+        shp.str().c_str(), decode_ok ? "" : " [skip: batch != 1]");
+
+    if (!decode_ok) continue;
+    if (regroup_and_rewrite(layer)) changed = true;
+  }
+  return changed;
+}
+
 void NpuOptimizer::Run(const std::shared_ptr<ov::Model>& model) const {
   ov::pass::Manager pass_manager;
   if (cast_integer_sign_to_float_) {
@@ -466,6 +1113,9 @@ void NpuOptimizer::Run(const std::shared_ptr<ov::Model>& model) const {
   }
   if (eliminate_matmul_fq_) {
     pass_manager.register_pass<EliminateMatMulFakeQuantize>();
+  }
+  if (enable_moe_gather_) {
+    pass_manager.register_pass<MoEGatherSelect>();
   }
   pass_manager.run_passes(model);
 }
